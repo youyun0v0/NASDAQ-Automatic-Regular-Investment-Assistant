@@ -3,141 +3,172 @@ import requests
 import datetime
 import os
 import sys
+import time
 
 # --- 配置区 ---
-# 从环境变量获取 Webhook，如果没有则使用空字符串（这会导致报错，提醒你去设置）
 WEBHOOK_URL = os.environ.get("WECHAT_WEBHOOK_URL", "")
-# 标的：纳指100 ETF
-TICKER = "QQQ" 
 
-def get_market_data_advanced():
-    """获取数据：计算年线偏离度和高点回撤"""
-    print(f"正在获取 {TICKER} 数据...")
+# 定义我们要监控的标的列表
+# 004253 对应国际黄金 GC=F
+TARGETS = [
+    {
+        "name": "纳指100 (QQQ)",
+        "symbol": "QQQ",
+        "type": "stock",  # 股票/指数类型
+        "thresholds": {"low": 0, "deep_low": -10, "high": 20} # 纳指波动大，阈值宽
+    },
+    {
+        "name": "国泰黄金 (004253)",
+        "symbol": "GC=F", # 使用COMEX黄金期货作为影子标的
+        "type": "gold",   # 黄金类型
+        "thresholds": {"low": 2, "deep_low": -5, "high": 15}  # 黄金波动小，阈值窄
+    }
+]
+
+def get_data_and_calc(target):
+    """通用数据获取与计算函数"""
+    symbol = target["symbol"]
+    print(f"正在获取 {target['name']} ({symbol}) 数据...")
     
-    # 获取过去 2 年数据 (计算年线需要250个交易日)
     try:
-        df = yf.download(TICKER, period="2y", progress=False)
+        # 黄金有时候会有数据延迟，多取一点数据保证能算出均线
+        df = yf.download(symbol, period="2y", progress=False)
+        time.sleep(1) # 防止请求过快被封
     except Exception as e:
-        print(f"下载数据失败: {e}")
-        sys.exit(1)
+        print(f"下载 {symbol} 失败: {e}")
+        return None
     
     if df.empty:
-        print("未获取到数据，请检查网络或股票代码")
-        sys.exit(1)
+        print(f"{symbol} 数据为空")
+        return None
 
-    # 获取最新收盘价 (.item() 将 numpy 类型转为 python原生 float)
-    current_price = df['Close'].iloc[-1].item()
-    last_date = df.index[-1].strftime('%Y-%m-%d')
-    
-    # 1. 计算年线 (MA250) 及 偏离度 (Bias)
-    # 如果数据不足250天，这里会报错，所以前面获取了2y数据
-    ma250 = df['Close'].rolling(window=250).mean().iloc[-1].item()
-    bias = (current_price - ma250) / ma250 * 100
-    
-    # 2. 计算距离 250 天内最高价的回撤幅度 (Drawdown)
-    high_250 = df['Close'].rolling(window=250).max().iloc[-1].item()
-    drawdown = (current_price - high_250) / high_250 * 100
-    
-    return {
-        "date": last_date,
-        "price": round(current_price, 2),
-        "ma250": round(ma250, 2),
-        "bias": round(bias, 2),       
-        "drawdown": round(drawdown, 2)
-    }
+    # 提取最新价格
+    try:
+        current_price = df['Close'].iloc[-1].item()
+        last_date = df.index[-1].strftime('%Y-%m-%d')
+        
+        # 计算 MA200 (黄金和美股常看200日线，也可用250)
+        ma200 = df['Close'].rolling(window=200).mean().iloc[-1].item()
+        
+        # 计算乖离率 Bias = (价格 - 均线) / 均线
+        bias = (current_price - ma200) / ma200 * 100
+        
+        # 计算回撤 (从250日高点跌了多少)
+        high_250 = df['Close'].rolling(window=250).max().iloc[-1].item()
+        drawdown = (current_price - high_250) / high_250 * 100
+        
+        return {
+            "name": target['name'],
+            "date": last_date,
+            "price": round(current_price, 2),
+            "ma200": round(ma200, 2),
+            "bias": round(bias, 2),
+            "drawdown": round(drawdown, 2),
+            "target_config": target
+        }
+    except Exception as e:
+        print(f"计算指标出错 {symbol}: {e}")
+        return None
 
-def get_strategy_advanced(data):
-    """根据偏离度和回撤生成建议"""
+def generate_advice(data):
+    """根据不同标的类型生成策略"""
+    t = data['target_config']
     bias = data['bias']
     dd = data['drawdown']
+    th = t['thresholds'] # 读取各自的阈值配置
     
     advice = ""
-    color = "info" # 默认绿色
+    level = "normal" # 级别：opportunity, normal, risk
     
-    # --- 策略逻辑 ---
-    if bias < -10:
-        advice = "💎 **钻石坑位**：低于年线10%以上\n👉 建议：**2.0倍 - 3.0倍 梭哈级定投**"
-        color = "info" 
-    elif bias < 0:
-        advice = "📀 **黄金坑位**：价格在年线下方\n👉 建议：**1.5倍 - 2.0倍 加倍定投**"
-        color = "info"
-    elif dd < -15:
-        advice = "📉 **急跌机会**：较高点回撤超15%\n👉 建议：**1.5倍 捡筹码**"
-        color = "info"
-    elif 0 <= bias < 15:
-        advice = "😐 **正常区间**：趋势向上但未过热\n👉 建议：**1.0倍 正常定投**"
-        color = "warning" # 橙色
-    elif bias >= 15 and bias < 25:
-        advice = "🔥 **略微过热**：偏离年线超15%\n👉 建议：**0.5倍 减少定投**"
-        color = "warning"
-    else: # bias >= 25
-        advice = "🚫 **极度过热**：偏离年线超25%\n👉 建议：**暂停买入 或 止盈**"
-        color = "warning" # 红色
-        
-    return advice, color
+    # --- 黄金特有策略逻辑 ---
+    if t['type'] == 'gold':
+        # 黄金看重趋势跟随，回调买入
+        if bias < th['deep_low']: # 比如低于年线5%
+            advice = "💎 **极度低估**：黄金罕见深跌，建议 **双倍定投**"
+            level = "opportunity"
+        elif bias < 0: 
+            advice = "📀 **跌破年线**：价格低于长期均线，建议 **1.5倍 积累筹码**"
+            level = "opportunity"
+        elif bias < th['low']: # 比如 0% ~ 2% 之间，贴着年线运行
+            advice = "⚖️ **支撑位**：回踩年线支撑，建议 **1.2倍 买入**"
+            level = "opportunity"
+        elif bias > th['high']:
+            advice = "🔥 **短期过热**：偏离年线过大，建议 **暂停买入**"
+            level = "risk"
+        else:
+            advice = "😐 **趋势向上**：温和上涨中，建议 **正常定投**"
+            level = "normal"
 
-def send_wechat_notification(data, advice, color="info"):
-    """发送消息到企业微信"""
-    
-    if not WEBHOOK_URL:
-        print("错误：未设置 WECHAT_WEBHOOK_URL 环境变量！")
+    # --- 纳指/股票策略逻辑 ---
+    else:
+        if bias < th['deep_low']: # 低于年线10%
+            advice = "💎 **钻石坑**：极度贪婪时刻，建议 **3倍 梭哈级定投**"
+            level = "opportunity"
+        elif bias < 0:
+            advice = "📀 **黄金坑**：年线下方，建议 **2倍 加码定投**"
+            level = "opportunity"
+        elif dd < -15:
+            advice = "📉 **急跌机会**：高点回撤超15%，建议 **1.5倍 捡筹码**"
+            level = "opportunity"
+        elif bias > th['high']:
+            advice = "🚫 **极度过热**：风险极大，建议 **止盈 或 观望**"
+            level = "risk"
+        else:
+            advice = "😐 **正常区间**：建议 **正常定投**"
+            level = "normal"
+            
+    return advice, level
+
+def send_combined_notification(results):
+    """发送合并后的消息"""
+    if not results:
         return
 
-    # 根据策略决定标题颜色 (markdown中绿色通常用info, 橙红用warning)
-    title_color = "info" if color == "info" else "warning"
-
-    markdown_content = f"""
-## <font color="{title_color}">🤖 纳斯达克定投助手</font>
-**日期**: {data['date']}
-**标的**: {TICKER} (纳指100)
-
----
-### 📊 核心指标
-- **当前价格**: ${data['price']}
-- **年线位置**: ${data['ma250']}
-- **年线偏离**: <font color="{title_color}">{data['bias']}%</font>
-- **高点回撤**: {data['drawdown']}%
-
----
-### 💡 投资建议
-{advice}
-    """
+    # 构造消息头部
+    current_date = results[0]['date']
+    markdown_content = f"## 🤖 智能定投日报\n**日期**: {current_date}\n\n"
     
+    for item in results:
+        advice, level = generate_advice(item)
+        
+        # 颜色标记
+        title_color = "info" # 默认绿
+        if level == "risk": title_color = "warning" # 红
+        if level == "normal": title_color = "comment" # 灰/黑
+        
+        # 不同的标的显示不同的 Emoji
+        icon = "🇺🇸" if item['target_config']['type'] == 'stock' else "🧈"
+        
+        block = f"""
+---
+### {icon} <font color="{title_color}">{item['name']}</font>
+- **价格**: {item['price']}
+- **年线乖离**: {item['bias']}% (MA200)
+- **高点回撤**: {item['drawdown']}%
+> **策略**: {advice}
+"""
+        markdown_content += block
+
     payload = {
         "msgtype": "markdown",
-        "markdown": {
-            "content": markdown_content.strip()
-        }
+        "markdown": {"content": markdown_content.strip()}
     }
     
-    try:
-        resp = requests.post(WEBHOOK_URL, json=payload)
-        resp.raise_for_status() # 如果是 4xx/5xx 错误直接抛出异常
-        
-        # 检查企业微信特有的错误码
-        result = resp.json()
-        if result.get("errcode") == 0:
-            print("✅ 消息发送成功！")
-        else:
-            print(f"❌ 企业微信拒绝接收: {result}")
-            sys.exit(1) # 让 Actions 变红
-            
-    except Exception as e:
-        print(f"❌ 网络请求发送失败: {e}")
-        sys.exit(1)
+    if WEBHOOK_URL:
+        try:
+            requests.post(WEBHOOK_URL, json=payload)
+            print("✅ 消息发送成功")
+        except Exception as e:
+            print(f"❌ 发送失败: {e}")
+    else:
+        print("未配置 Webhook，跳过发送")
+        print(markdown_content)
 
-# --- 主程序入口 ---
 if __name__ == "__main__":
-    try:
-        # 1. 获取数据 (使用 Advanced 版本)
-        market_data = get_market_data_advanced()
-        
-        # 2. 生成策略
-        advice_text, color_code = get_strategy_advanced(market_data)
-        
-        # 3. 发送通知
-        send_wechat_notification(market_data, advice_text, color_code)
-        
-    except Exception as e:
-        print(f"❌ 脚本运行出错: {e}")
-        sys.exit(1)
+    results = []
+    for target in TARGETS:
+        data = get_data_and_calc(target)
+        if data:
+            results.append(data)
+    
+    send_combined_notification(results)
