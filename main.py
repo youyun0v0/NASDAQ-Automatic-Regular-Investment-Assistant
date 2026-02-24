@@ -16,7 +16,8 @@ TARGETS = [
         "name": "纳指100 (QQQ)",
         "symbol": "QQQ",
         "backup_symbol": None,
-        "type": "stock_us",  
+        "type": "stock_us",
+        "currency": "$", # 新增货币符号
         "thresholds": {"low": 0, "deep_low": -15, "high": 20},
     },
     # 2. 全球避险 (防守)
@@ -24,7 +25,8 @@ TARGETS = [
         "name": "国泰黄金 (004253)",
         "symbol": "GC=F", 
         "backup_symbol": "GLD", 
-        "type": "gold",   
+        "type": "gold",
+        "currency": "$", # 国际金价为美元
         "thresholds": {"low": 2, "deep_low": -5, "high": 15},
     },
     # 3. A股基本盘 (稳健)
@@ -33,14 +35,16 @@ TARGETS = [
         "symbol": "000300.SS",  
         "backup_symbol": "ASHR", 
         "type": "stock_cn_value", 
+        "currency": "¥", # A股为人民币
         "thresholds": {"low": -5, "deep_low": -15, "high": 10},
     },
     # 4. A股高弹性 (激进)
     {
         "name": "创业板指 (399006)", 
         "symbol": "399006.SZ",  
-        "backup_symbol": "CNXT", # 关键备用源
+        "backup_symbol": "CNXT", 
         "type": "stock_cn_growth", 
+        "currency": "¥",
         "thresholds": {"low": -10, "deep_low": -25, "high": 25},
     }
 ]
@@ -49,6 +53,8 @@ def fetch_data(symbol):
     """尝试获取数据"""
     try:
         df = yf.download(symbol, period="2y", progress=False)
+        # 清理掉当天可能存在的全是 NaN 的脏数据
+        df = df.dropna(subset=['Close'])
         if df.empty or len(df) < 250: return None
         return df
     except: return None
@@ -72,12 +78,17 @@ def get_data_and_calc(target):
         return None
 
     try:
+        # 获取最新价和昨日收盘价
         current_price = df['Close'].iloc[-1].item()
+        prev_price = df['Close'].iloc[-2].item()
         last_date = df.index[-1].strftime('%Y-%m-%d')
+        
+        # 计算涨跌幅
+        daily_change = (current_price - prev_price) / prev_price * 100
         
         # 计算 MA250
         ma250 = df['Close'].rolling(window=250).mean().iloc[-1].item()
-        if math.isnan(ma250): return None # 数据不足
+        if math.isnan(ma250): return None 
 
         # 计算指标
         bias = (current_price - ma250) / ma250 * 100
@@ -88,6 +99,7 @@ def get_data_and_calc(target):
             "name": name,
             "date": last_date,
             "price": round(current_price, 2),
+            "daily_change": round(daily_change, 2), # 新增涨跌幅
             "bias": round(bias, 2),
             "drawdown": round(drawdown, 2),
             "target_config": target
@@ -144,7 +156,7 @@ def generate_advice(data):
     # 3. A股成长 (创业板)
     elif t['type'] == 'stock_cn_growth':
         if bias < th['deep_low']: 
-            advice = "⚡ **血流成河**：崩盘式下跌，建议 **4.0倍 极限抄底**"
+            advice = "⚡ **血流成河**：崩盘下跌，建议 **4.0倍 极限抄底**"
             level = "opportunity"
         elif bias < th['low']:    
             advice = "📉 **击穿防线**：跌破年线，建议 **2.0倍 越跌越买**"
@@ -187,7 +199,6 @@ def get_pretty_strategy_text():
         th = t['thresholds']
         t_type = t['type']
         
-        # 设置图标
         if 'us' in t_type: icon = "🇺🇸"
         elif 'gold' in t_type: icon = "🧈"
         elif 'growth' in t_type: icon = "⚡"
@@ -195,54 +206,65 @@ def get_pretty_strategy_text():
         
         text += f"**{icon} {name_short}**\n"
         
-        # 根据类型显示不同的文案和阈值
-        if 'growth' in t_type: # 创业板
+        if 'growth' in t_type:
             text += f"- ⚡ **血流成河**: 偏离 < {th['deep_low']}% (4倍抄底)\n"
             text += f"- 💣 **极度泡沫**: 偏离 > {th['high']}% (清仓走人)\n"
-        elif 'gold' in t_type: # 黄金
+        elif 'gold' in t_type:
             text += f"- 💎 **极度低估**: 偏离 < {th['deep_low']}% (2倍囤货)\n"
             text += f"- 🔥 **短期过热**: 偏离 > {th['high']}% (暂停买入)\n"
-        elif 'value' in t_type: # 蓝筹
+        elif 'value' in t_type:
             text += f"- 🇨🇳 **遍地黄金**: 偏离 < {th['deep_low']}% (3倍大额)\n"
             text += f"- 🚀 **情绪高涨**: 偏离 > {th['high']}% (止盈/暂停)\n"
-        else: # 美股
+        else:
             text += f"- 💎 **钻石坑位**: 偏离 < {th['deep_low']}% (3倍梭哈)\n"
             text += f"- 🚫 **极度过热**: 偏离 > {th['high']}% (止盈/观望)\n"
             
-        text += "\n" # 空一行分隔
+        text += "\n"
         
     text += "> <font color=\"comment\">注：偏离指当前价与年线(MA250)的距离</font>"
     return text
 
 def send_combined_notification(results):
     if not results: return
-    current_date = results[0]['date']
     
-    # 1. 顶部
-    markdown_content = f"## 🤖 全球定投日报\n**日期**: {current_date}\n\n"
+    # 获取今天北京时间
+    bjt_time = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M')
     
-    # 2. 核心卡片
+    markdown_content = f"## 🤖 全球定投日报\n**时间**: {bjt_time}\n\n"
+    
     for item in results:
         advice, level = generate_advice(item)
         title_color = "warning" if level == "risk" else "info"
         if level == "normal": title_color = "comment"
         
-        t_type = item['target_config']['type']
+        t = item['target_config']
+        t_type = t['type']
+        currency = t.get('currency', '')
+        
         if 'us' in t_type: icon = "🇺🇸"
         elif 'gold' in t_type: icon = "🧈"
         elif 'growth' in t_type: icon = "⚡"
         else: icon = "🇨🇳"
         
+        # 涨跌幅格式化 (带表情和正负号)
+        change = item['daily_change']
+        if change > 0:
+            change_str = f"+{change}% 📈"
+        elif change < 0:
+            change_str = f"{change}% 📉"
+        else:
+            change_str = "0.00% ➖"
+        
         block = f"""
 ---
 ### {icon} <font color="{title_color}">{item['name']}</font>
+- **当前价格**: {currency}{item['price']} ({change_str})
 - **年线乖离**: {item['bias']}%
 - **高点回撤**: {item['drawdown']}%
 > **策略**: {advice}
 """
         markdown_content += block
 
-    # 3. 底部说明书
     markdown_content += get_pretty_strategy_text()
 
     payload = {"msgtype": "markdown", "markdown": {"content": markdown_content.strip()}}
