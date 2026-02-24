@@ -8,7 +8,6 @@ import math
 # --- 配置区 ---
 WEBHOOK_URL = os.environ.get("WECHAT_WEBHOOK_URL", "")
 
-# --- 投资标的配置 ---
 TARGETS = [
     {
         "name": "纳指100 (QQQ)",
@@ -44,76 +43,85 @@ TARGETS = [
     }
 ]
 
-def fetch_data(symbol):
-    """尝试获取数据 (使用更稳定的 Ticker API)"""
+def get_tencent_realtime(symbol):
+    """【核心补丁】通过腾讯财经API获取A股秒级实时数据，解决雅虎延迟"""
+    if symbol.endswith(".SS"):
+        ts_code = "sh" + symbol.split(".")[0]
+    elif symbol.endswith(".SZ"):
+        ts_code = "sz" + symbol.split(".")[0]
+    else:
+        return None
+        
+    url = f"http://qt.gtimg.cn/q={ts_code}"
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        # 使用 Ticker 对象获取历史数据，比 download 更稳定
+        r = requests.get(url, headers=headers, timeout=5)
+        # 腾讯接口返回格式: v_sz399006="51~创业板指~399006~1820.30(当前价)~1788.88(昨收)~...
+        data = r.text.split("~")
+        if len(data) > 5:
+            current_price = float(data[3])
+            yest_close = float(data[4])
+            if yest_close > 0:
+                change_pct = (current_price - yest_close) / yest_close * 100
+                return current_price, change_pct
+    except Exception as e:
+        print(f"  -> 腾讯API请求失败: {e}")
+    return None
+
+def fetch_data(symbol):
+    """获取历史数据用于计算均线"""
+    try:
         ticker = yf.Ticker(symbol)
         df = ticker.history(period="2y")
-        
-        if df is None or df.empty:
-            print(f"  -> 获取到的 {symbol} 数据为空")
-            return None
-            
-        # 检查是否包含 Close 列
-        if 'Close' not in df.columns:
-            print(f"  -> {symbol} 返回的数据缺少 'Close' 列。当前列名: {list(df.columns)}")
-            return None
-            
-        # 清理 NaN 数据
+        if df is None or df.empty or 'Close' not in df.columns: return None
         df = df.dropna(subset=['Close'])
-        
-        # 检查数据长度是否足够计算 250 日均线
-        if len(df) < 250:
-            print(f"  -> {symbol} 数据长度不足 250 天 (仅 {len(df)} 天)")
-            return None
-            
+        if len(df) < 250: return None
         return df
-    except Exception as e:
-        print(f"  -> 获取 {symbol} 发生异常: {e}")
+    except:
         return None
 
 def get_data_and_calc(target):
-    """智能数据获取与计算"""
     symbol = target["symbol"]
     name = target["name"]
     print(f"正在获取 {name} ({symbol})...")
     
-    # 主备切换逻辑
+    used_backup = False
     df = fetch_data(symbol)
     if df is None and target.get("backup_symbol"):
         backup = target["backup_symbol"]
         print(f"⚠️ 切换备用源: {backup}")
         df = fetch_data(backup)
         symbol = backup
+        used_backup = True
     
     if df is None:
-        print(f"❌ {name} 数据获取彻底失败")
+        print(f"❌ {name} 数据获取失败")
         return None
 
     try:
-        # 获取最新价和昨日收盘价 (使用原生 float 类型)
+        # 1. 默认使用雅虎数据作为基础
         current_price = float(df['Close'].iloc[-1])
         prev_price = float(df['Close'].iloc[-2])
-        last_date = df.index[-1].strftime('%Y-%m-%d')
-        
-        # 计算涨跌幅
         daily_change = (current_price - prev_price) / prev_price * 100
         
-        # 计算 MA250
         ma250 = float(df['Close'].rolling(window=250).mean().iloc[-1])
-        if math.isnan(ma250): 
-            print(f"  -> {name} 计算出的 MA250 为 NaN")
-            return None 
-
-        # 计算指标
-        bias = (current_price - ma250) / ma250 * 100
         high_250 = float(df['Close'].rolling(window=250).max().iloc[-1])
+        if math.isnan(ma250): return None 
+
+        # 2. 【A股专属实时覆盖】如果在交易时间，强行用腾讯的最新价格覆盖雅虎的滞后价格
+        if 'cn' in target['type'] and not used_backup:
+            rt_data = get_tencent_realtime(target['symbol'])
+            if rt_data:
+                current_price, daily_change = rt_data
+                print(f"  -> ⚡ 成功抓取国内实时行情: {current_price}, {round(daily_change, 2)}%")
+
+        # 3. 根据最终的、最准确的当前价，重新计算偏离度
+        bias = (current_price - ma250) / ma250 * 100
         drawdown = (current_price - high_250) / high_250 * 100
         
         return {
             "name": name,
-            "date": last_date,
+            "date": datetime.datetime.utcnow().strftime('%Y-%m-%d'),
             "price": round(current_price, 2),
             "daily_change": round(daily_change, 2), 
             "bias": round(bias, 2),
@@ -125,7 +133,6 @@ def get_data_and_calc(target):
         return None
 
 def generate_advice(data):
-    """生成具体的策略建议"""
     t = data['target_config']
     bias = data['bias']
     dd = data['drawdown']
@@ -203,7 +210,6 @@ def generate_advice(data):
     return advice, level
 
 def get_pretty_strategy_text():
-    """生成美观的策略列表"""
     text = "\n\n---\n### 📖 策略说明书\n"
     for t in TARGETS:
         name_short = t['name'].split("(")[0]
@@ -235,9 +241,7 @@ def get_pretty_strategy_text():
     return text
 
 def send_combined_notification(results):
-    if not results: 
-        print("没有可发送的数据！")
-        return
+    if not results: return
     
     bjt_time = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M')
     markdown_content = f"## 🤖 全球定投日报\n**时间**: {bjt_time}\n\n"
