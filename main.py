@@ -3,7 +3,6 @@ import requests
 import datetime
 import os
 import sys
-import time
 import math
 
 # --- 配置区 ---
@@ -11,34 +10,30 @@ WEBHOOK_URL = os.environ.get("WECHAT_WEBHOOK_URL", "")
 
 # --- 投资标的配置 ---
 TARGETS = [
-    # 1. 美股成长 (进攻)
     {
         "name": "纳指100 (QQQ)",
         "symbol": "QQQ",
         "backup_symbol": None,
         "type": "stock_us",
-        "currency": "$", # 新增货币符号
+        "currency": "$",
         "thresholds": {"low": 0, "deep_low": -15, "high": 20},
     },
-    # 2. 全球避险 (防守)
     {
         "name": "国泰黄金 (004253)",
         "symbol": "GC=F", 
         "backup_symbol": "GLD", 
         "type": "gold",
-        "currency": "$", # 国际金价为美元
+        "currency": "$",
         "thresholds": {"low": 2, "deep_low": -5, "high": 15},
     },
-    # 3. A股基本盘 (稳健)
     {
         "name": "沪深300 (A股大盘)", 
         "symbol": "000300.SS",  
         "backup_symbol": "ASHR", 
         "type": "stock_cn_value", 
-        "currency": "¥", # A股为人民币
+        "currency": "¥",
         "thresholds": {"low": -5, "deep_low": -15, "high": 10},
     },
-    # 4. A股高弹性 (激进)
     {
         "name": "创业板指 (399006)", 
         "symbol": "399006.SZ",  
@@ -50,14 +45,33 @@ TARGETS = [
 ]
 
 def fetch_data(symbol):
-    """尝试获取数据"""
+    """尝试获取数据 (使用更稳定的 Ticker API)"""
     try:
-        df = yf.download(symbol, period="2y", progress=False)
-        # 清理掉当天可能存在的全是 NaN 的脏数据
+        # 使用 Ticker 对象获取历史数据，比 download 更稳定
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="2y")
+        
+        if df is None or df.empty:
+            print(f"  -> 获取到的 {symbol} 数据为空")
+            return None
+            
+        # 检查是否包含 Close 列
+        if 'Close' not in df.columns:
+            print(f"  -> {symbol} 返回的数据缺少 'Close' 列。当前列名: {list(df.columns)}")
+            return None
+            
+        # 清理 NaN 数据
         df = df.dropna(subset=['Close'])
-        if df.empty or len(df) < 250: return None
+        
+        # 检查数据长度是否足够计算 250 日均线
+        if len(df) < 250:
+            print(f"  -> {symbol} 数据长度不足 250 天 (仅 {len(df)} 天)")
+            return None
+            
         return df
-    except: return None
+    except Exception as e:
+        print(f"  -> 获取 {symbol} 发生异常: {e}")
+        return None
 
 def get_data_and_calc(target):
     """智能数据获取与计算"""
@@ -74,38 +88,40 @@ def get_data_and_calc(target):
         symbol = backup
     
     if df is None:
-        print(f"❌ {name} 数据获取失败")
+        print(f"❌ {name} 数据获取彻底失败")
         return None
 
     try:
-        # 获取最新价和昨日收盘价
-        current_price = df['Close'].iloc[-1].item()
-        prev_price = df['Close'].iloc[-2].item()
+        # 获取最新价和昨日收盘价 (使用原生 float 类型)
+        current_price = float(df['Close'].iloc[-1])
+        prev_price = float(df['Close'].iloc[-2])
         last_date = df.index[-1].strftime('%Y-%m-%d')
         
         # 计算涨跌幅
         daily_change = (current_price - prev_price) / prev_price * 100
         
         # 计算 MA250
-        ma250 = df['Close'].rolling(window=250).mean().iloc[-1].item()
-        if math.isnan(ma250): return None 
+        ma250 = float(df['Close'].rolling(window=250).mean().iloc[-1])
+        if math.isnan(ma250): 
+            print(f"  -> {name} 计算出的 MA250 为 NaN")
+            return None 
 
         # 计算指标
         bias = (current_price - ma250) / ma250 * 100
-        high_250 = df['Close'].rolling(window=250).max().iloc[-1].item()
+        high_250 = float(df['Close'].rolling(window=250).max().iloc[-1])
         drawdown = (current_price - high_250) / high_250 * 100
         
         return {
             "name": name,
             "date": last_date,
             "price": round(current_price, 2),
-            "daily_change": round(daily_change, 2), # 新增涨跌幅
+            "daily_change": round(daily_change, 2), 
             "bias": round(bias, 2),
             "drawdown": round(drawdown, 2),
             "target_config": target
         }
     except Exception as e:
-        print(f"❌ 计算出错 {name}: {e}")
+        print(f"❌ 计算指标出错 {name}: {e}")
         return None
 
 def generate_advice(data):
@@ -118,7 +134,6 @@ def generate_advice(data):
     advice = ""
     level = "normal"
     
-    # 1. 黄金策略
     if t['type'] == 'gold':
         if bias < th['deep_low']: 
             advice = "💎 **极度低估**：罕见机会，建议 **2.0倍 囤货**"
@@ -135,7 +150,6 @@ def generate_advice(data):
         else:
             advice = "😐 **趋势向上**：建议 **正常定投**"
 
-    # 2. A股蓝筹
     elif t['type'] == 'stock_cn_value':
         if bias < th['deep_low']: 
             advice = "🇨🇳 **遍地黄金**：极度低估，建议 **3.0倍 大额买入**"
@@ -153,7 +167,6 @@ def generate_advice(data):
             advice = "🐢 **磨底震荡**：建议 **1.0倍 坚持**"
             level = "normal"
 
-    # 3. A股成长 (创业板)
     elif t['type'] == 'stock_cn_growth':
         if bias < th['deep_low']: 
             advice = "⚡ **血流成河**：崩盘下跌，建议 **4.0倍 极限抄底**"
@@ -171,7 +184,6 @@ def generate_advice(data):
             advice = "🎲 **高波震荡**：看不清方向，建议 **少投 或 观望**"
             level = "normal"
 
-    # 4. 美股成长
     else: 
         if bias < th['deep_low']: 
             advice = "💎 **钻石坑**：极度贪婪时刻，建议 **3倍 梭哈**"
@@ -193,7 +205,6 @@ def generate_advice(data):
 def get_pretty_strategy_text():
     """生成美观的策略列表"""
     text = "\n\n---\n### 📖 策略说明书\n"
-    
     for t in TARGETS:
         name_short = t['name'].split("(")[0]
         th = t['thresholds']
@@ -218,18 +229,17 @@ def get_pretty_strategy_text():
         else:
             text += f"- 💎 **钻石坑位**: 偏离 < {th['deep_low']}% (3倍梭哈)\n"
             text += f"- 🚫 **极度过热**: 偏离 > {th['high']}% (止盈/观望)\n"
-            
         text += "\n"
         
     text += "> <font color=\"comment\">注：偏离指当前价与年线(MA250)的距离</font>"
     return text
 
 def send_combined_notification(results):
-    if not results: return
+    if not results: 
+        print("没有可发送的数据！")
+        return
     
-    # 获取今天北京时间
     bjt_time = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M')
-    
     markdown_content = f"## 🤖 全球定投日报\n**时间**: {bjt_time}\n\n"
     
     for item in results:
@@ -246,14 +256,10 @@ def send_combined_notification(results):
         elif 'growth' in t_type: icon = "⚡"
         else: icon = "🇨🇳"
         
-        # 涨跌幅格式化 (带表情和正负号)
         change = item['daily_change']
-        if change > 0:
-            change_str = f"+{change}% 📈"
-        elif change < 0:
-            change_str = f"{change}% 📉"
-        else:
-            change_str = "0.00% ➖"
+        if change > 0: change_str = f"+{change}% 📈"
+        elif change < 0: change_str = f"{change}% 📉"
+        else: change_str = "0.00% ➖"
         
         block = f"""
 ---
@@ -266,7 +272,6 @@ def send_combined_notification(results):
         markdown_content += block
 
     markdown_content += get_pretty_strategy_text()
-
     payload = {"msgtype": "markdown", "markdown": {"content": markdown_content.strip()}}
     
     if WEBHOOK_URL:
